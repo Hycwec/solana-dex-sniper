@@ -90,6 +90,7 @@ There is no guarantee that the token will be sold at a profit or even sold at al
 By default, script buys each token which has a new liquidity pool created and open for trading.
 There are scenarios when you want to buy one specific token as soon as possible during the launch event.
 To achieve this, you'll have to use snipe list.
+
 1. Change variable `USE_SNIPE_LIST` to `true` 
 2. Add token mint addresses you wish to buy in `snipe-list.txt` file (add each address as a new line).
 
